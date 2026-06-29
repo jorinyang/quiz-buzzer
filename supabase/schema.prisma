@@ -1,0 +1,151 @@
+// =====================================================
+// quiz-buzzer Prisma Schema
+// Database: Supabase PostgreSQL
+// =====================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------- 用户 ----------
+model User {
+  id           String     @id @default(uuid())
+  username     String     @unique
+  passwordHash String     @map("password_hash")
+  displayName  String     @map("display_name")
+  role         String     @default("player") // UserRole enum handled at app level
+  teamId       String?    @map("team_id")
+  team         Team?      @relation(fields: [teamId], references: [id])
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  scoreReceived ScoreRecord[]
+  buzzerEvents  BuzzerEvent[]
+
+  @@map("users")
+}
+
+// ---------- 队伍 ----------
+model Team {
+  id         String   @id @default(uuid())
+  name       String
+  county     String?
+  leaderName String?  @map("leader_name")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  members       User[]
+  scoreReceived ScoreRecord[]
+
+  @@map("teams")
+}
+
+// ---------- 比赛 ----------
+model Competition {
+  id        String    @id @default(uuid())
+  name      String
+  status    String    @default("pending") // CompetitionStatus
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  rounds        Round[]
+  questions     Question[]
+  scoreRecords  ScoreRecord[]
+  buzzerEvents  BuzzerEvent[]
+  judgeScores   JudgeScore[]
+
+  @@map("competitions")
+}
+
+// ---------- 环节（轮次） ----------
+model Round {
+  id            String      @id @default(uuid())
+  competitionId String      @map("competition_id")
+  competition   Competition @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+  roundType     String      @map("round_type") // RoundType
+  roundOrder    Int         @map("round_order")
+  title         String
+  config        Json?       // { "questionCount": 20, "timeLimit": 10, "scoreCorrect": 10, "scoreWrong": -10, "scoreNoAnswer": 0 }
+  status        String      @default("pending") // RoundStatus
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  questions Question[]
+
+  @@map("rounds")
+}
+
+// ---------- 题目 ----------
+model Question {
+  id            String      @id @default(uuid())
+  competitionId String      @map("competition_id")
+  competition   Competition @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+  roundId       String?     @map("round_id")
+  round         Round?      @relation(fields: [roundId], references: [id], onDelete: SetNull)
+  type          String      // QuestionType
+  content       String
+  options       Json?       // ["A. xxx", "B. xxx", "C. xxx", "D. xxx"]
+  answer        String
+  scoreValue    Int         @default(10) @map("score_value")
+  sortOrder     Int         @default(0) @map("sort_order")
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  scoreRecords  ScoreRecord[]
+  buzzerEvents  BuzzerEvent[]
+
+  @@map("questions")
+}
+
+// ---------- 计分记录 ----------
+model ScoreRecord {
+  id            String      @id @default(uuid())
+  competitionId String      @map("competition_id")
+  competition   Competition @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+  playerId      String      @map("player_id")
+  player        User        @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  teamId        String      @map("team_id")
+  team          Team        @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  roundId       String?     @map("round_id")
+  questionId    String?     @map("question_id")
+  question      Question?   @relation(fields: [questionId], references: [id], onDelete: SetNull)
+  scoreChange   Int         @map("score_change")
+  reason        String?
+  operatorId    String?     @map("operator_id")
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  @@map("score_records")
+}
+
+// ---------- 抢答事件 ----------
+model BuzzerEvent {
+  id            String      @id @default(uuid())
+  competitionId String      @map("competition_id")
+  competition   Competition @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+  questionId    String      @map("question_id")
+  question      Question    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  playerId      String      @map("player_id")
+  player        User        @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  teamId        String      @map("team_id")
+  buzzedAt      DateTime    @default(now()) @map("buzzed_at")
+  latencyMs     Int         @map("latency_ms")
+  status        String      // BuzzerStatus
+
+  @@map("buzzer_events")
+}
+
+// ---------- 模拟调解评委打分 ----------
+model JudgeScore {
+  id              String      @id @default(uuid())
+  competitionId   String      @map("competition_id")
+  competition     Competition @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+  playerId        String      @map("player_id")
+  judgeId         String      @map("judge_id")
+  criterionScores Json        @map("criterion_scores") // {"lawApply":22, "process":23, "communication":21, "effect":24}
+  totalScore      Int         @map("total_score")
+  comment         String?
+  createdAt       DateTime    @default(now()) @map("created_at")
+
+  @@map("judge_scores")
+}
