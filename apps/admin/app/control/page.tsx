@@ -6,18 +6,22 @@ import { Play, Square, SkipForward, Zap, CheckCircle, XCircle, Clock } from 'luc
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3080'
 
-// Dynamic countdown based on question type
+type QuestionType = 'choice' | 'true_false' | 'fill_blank' | 'short_answer'
+
 function getTimeLimit(round: any, question: any): number {
-  if (round?.round_type === 'simulation') return 0 // no timer for simulation
+  if (round?.round_type === 'simulation') return 0
   if (round?.config?.timeLimit) return round.config.timeLimit
   if (!question) return 10
-  switch (question.type) {
-    case 'choice': return 10
-    case 'true_false': return 5
-    case 'fill_blank': return 15
-    case 'short_answer': return 30
-    default: return 10
-  }
+  const limits: Record<QuestionType, number> = { choice: 10, true_false: 5, fill_blank: 15, short_answer: 30 }
+  return limits[question.type as QuestionType] || 10
+}
+
+function autoGrade(question: any, answer: string, type: QuestionType): boolean {
+  // choice/tf/fill_blank can be auto-graded; short_answer always needs judge
+  if (type === 'short_answer') return false
+  const correct = question.answer?.toString().trim().toUpperCase()
+  const given = answer?.toString().trim().toUpperCase()
+  return correct === given
 }
 
 export default function ControlPage() {
@@ -28,12 +32,14 @@ export default function ControlPage() {
   const [currentQIndex, setCurrentQIndex] = useState(-1)
   const [currentPlayerIndex, setCurrentPlayerIndex] = useState(0)
   const [players, setPlayers] = useState<any[]>([])
-  const [remainingSec, setRemainingSec] = useState(10)
+  const [remainingSec, setRemainingSec] = useState(0)
   const [timerStatus, setTimerStatus] = useState<string>('stopped')
   const [buzzerOpen, setBuzzerOpen] = useState(false)
   const [buzzerResult, setBuzzerResult] = useState<any>(null)
   const [connected, setConnected] = useState(false)
   const [teamRankings, setTeamRankings] = useState<any[]>([])
+  const [playerAnswers, setPlayerAnswers] = useState<Record<string, string>>({})
+  const [awaitingJudge, setAwaitingJudge] = useState<string | null>(null) // playerId waiting for judge score
 
   const wsRef = useRef<WebSocket | null>(null)
   const supabase = getSupabase()
@@ -41,9 +47,7 @@ export default function ControlPage() {
   // Load competition
   useEffect(() => {
     supabase.from('competitions').select('*, rounds(*)').order('created_at', { ascending: false }).limit(1).single()
-      .then(({ data }) => {
-        if (data) { setCompetition(data); setRounds(data.rounds || []) }
-      })
+      .then(({ data }) => { if (data) { setCompetition(data); setRounds(data.rounds || []) } })
   }, [])
 
   // Load players
@@ -52,33 +56,9 @@ export default function ControlPage() {
       .then(({ data }) => setPlayers(data || []))
   }, [])
 
-  // Connect WS + sync timer from server
-  useEffect(() => {
-    const ws = new WebSocket(WS_URL)
-    wsRef.current = ws
-    ws.onopen = () => setConnected(true)
-    ws.onclose = () => setConnected(false)
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data)
-        switch (msg.type) {
-          case 'state.timer':
-            setRemainingSec(msg.payload.remainingSec as number)
-            setTimerStatus(msg.payload.status as string)
-            break
-          case 'state.buzzer.result':
-            if (msg.payload?.status === 'first') {
-              setBuzzerResult(msg.payload)
-              setBuzzerOpen(false)
-            }
-            break
-        }
-      } catch(e) {}
-    }
-    return () => ws.close()
-  }, [])
+  // Connect WS
+  useEffect(() => { connectWs(); return () => { wsRef.current?.close() } }, [])
 
-  // Load rankings
   const loadRankings = useCallback(async () => {
     const { data: teams } = await supabase.from('teams').select('id, name')
     const { data: scores } = await supabase.from('score_records').select('team_id, score_change')
@@ -92,6 +72,68 @@ export default function ControlPage() {
 
   useEffect(() => { loadRankings() }, [loadRankings])
 
+  function connectWs() {
+    const ws = new WebSocket(WS_URL)
+    wsRef.current = ws
+    ws.onopen = () => setConnected(true)
+    ws.onclose = () => { setConnected(false); setTimeout(connectWs, 2000) }
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data)
+        switch (msg.type) {
+          case 'state.timer':
+            setRemainingSec(msg.payload.remainingSec as number)
+            setTimerStatus(msg.payload.status as string)
+            break
+          case 'state.buzzer.result':
+            if (msg.payload?.status === 'first') { setBuzzerResult(msg.payload); setBuzzerOpen(false) }
+            break
+          case 'state.player_answer':
+            // Receive player answer, auto-grade if possible
+            handlePlayerAnswer(msg.payload)
+            break
+        }
+      } catch(e) {}
+    }
+  }
+
+  async function handlePlayerAnswer(payload: any) {
+    const { playerId, teamId, teamName, playerName, answer, questionId } = payload
+    setPlayerAnswers(prev => ({ ...prev, [playerId]: answer }))
+
+    const q = questions[currentQIndex]
+    if (!q || q.id !== questionId) return
+
+    if (autoGrade(q, answer, q.type as QuestionType)) {
+      // Auto-grade: correct or wrong
+      const isCorrect = autoGrade(q, answer, q.type as QuestionType)
+      await applyScore(playerId, teamId, playerName, teamName, isCorrect, answer)
+    } else if (q.type === 'short_answer') {
+      // Needs judge scoring
+      setAwaitingJudge(playerId)
+    }
+  }
+
+  async function applyScore(playerId: string, teamId: string, playerName: string, teamName: string, correct: boolean, answer?: string) {
+    const q = questions[currentQIndex]
+    if (!q) return
+    const config = currentRound?.config || {}
+    const scoreChange = correct ? (config.scoreCorrect || q.score_value) : 0 // no penalty in required
+
+    // Save to Supabase
+    await supabase.from('score_records').insert({
+      competition_id: competition?.id,
+      player_id: playerId, team_id: teamId,
+      round_id: currentRound?.id, question_id: q.id,
+      score_change: scoreChange,
+      reason: correct ? `正确 (${answer || ''})` : `错误 (${answer || ''})`,
+    })
+
+    const rankings = await loadRankings()
+    send('score.confirm', { playerId, teamId, scoreChange, questionId: q.id, correct, playerName, teamName, rankings })
+    send('timer.stop', {})
+  }
+
   function send(type: string, payload: any = {}) {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type, payload, timestamp: Date.now() }))
@@ -99,11 +141,8 @@ export default function ControlPage() {
   }
 
   const selectRound = useCallback(async (round: any) => {
-    setCurrentRound(round)
-    setCurrentQIndex(-1)
-    setBuzzerResult(null)
-    setBuzzerOpen(false)
-    setTimerStatus('stopped')
+    setCurrentRound(round); setCurrentQIndex(-1); setBuzzerResult(null); setBuzzerOpen(false)
+    setPlayerAnswers({}); setAwaitingJudge(null); setTimerStatus('stopped')
     send('round.start', { competitionId: competition?.id, roundId: round.id, title: round.title, roundType: round.round_type })
     const { data } = await supabase.from('questions').select('*').eq('round_id', round.id).order('sort_order')
     setQuestions(data || [])
@@ -111,9 +150,8 @@ export default function ControlPage() {
 
   const showQuestion = useCallback((index: number) => {
     if (index < 0 || index >= questions.length) return
-    setCurrentQIndex(index)
-    setBuzzerResult(null)
-    setBuzzerOpen(false)
+    setCurrentQIndex(index); setBuzzerResult(null); setBuzzerOpen(false)
+    setPlayerAnswers({}); setAwaitingJudge(null)
     const q = questions[index]
     const limit = getTimeLimit(currentRound, q)
 
@@ -122,28 +160,28 @@ export default function ControlPage() {
       const p = players[currentPlayerIndex % players.length]
       playerId = p.id
       const teamIdx = Math.floor(currentPlayerIndex / 3)
-      const playerIdx = (currentPlayerIndex % 3)
-      playerDisplayId = `${teamIdx + 1}-${playerIdx + 1}`
+      playerDisplayId = `${teamIdx + 1}-${(currentPlayerIndex % 3) + 1}`
     }
 
     send('question.show', {
-      competitionId: competition?.id,
-      questionId: q.id, content: q.content, type: q.type, options: q.options,
-      scoreValue: q.score_value, playerId, playerDisplayId, roundType: currentRound?.round_type,
+      competitionId: competition?.id, questionId: q.id, content: q.content, type: q.type,
+      options: q.options, scoreValue: q.score_value, playerId, playerDisplayId,
+      roundType: currentRound?.round_type,
     })
 
     if (currentRound?.round_type !== 'simulation' && limit > 0) {
       send('timer.start', { durationSec: limit })
     }
+    // For buzzer rounds, question is shown to admin only, NOT to players yet
+    // Players get question only after they buzz successfully
   }, [questions, currentRound, players, currentPlayerIndex, competition])
 
   const nextQuestion = useCallback(() => {
     const next = currentQIndex + 1
     if (next >= questions.length) { alert('当前环节题目已用完'); return }
-    setBuzzerResult(null)
-    setBuzzerOpen(false)
-    setTimerStatus('stopped')
-    send('timer.stop', {})
+    setBuzzerResult(null); setBuzzerOpen(false)
+    setPlayerAnswers({}); setAwaitingJudge(null)
+    setTimerStatus('stopped'); send('timer.stop', {})
     if (currentRound?.round_type === 'required') {
       setCurrentPlayerIndex((prev: number) => (prev + 1) % players.length)
     }
@@ -153,52 +191,58 @@ export default function ControlPage() {
   const openBuzzer = useCallback(() => {
     const q = questions[currentQIndex]
     if (!q) return
-    setBuzzerOpen(true)
-    setBuzzerResult(null)
+    setBuzzerOpen(true); setBuzzerResult(null); setPlayerAnswers({})
     const limit = getTimeLimit(currentRound, q)
+    // Send buzzer open WITHOUT question content
     send('buzzer.open', { competitionId: competition?.id, questionId: q.id, durationSec: limit })
   }, [questions, currentQIndex, competition, currentRound])
 
-  const confirmScore = useCallback(async (correct: boolean) => {
+  // Manual confirm for operator (buzzer rounds, or operator override)
+  const manualConfirm = useCallback(async (correct: boolean) => {
     const q = questions[currentQIndex]
     if (!q) return
-
-    // Determine current player and team
     let playerId = 'unknown', teamId = 'unknown', playerName = 'unknown', teamName = 'unknown'
+
     if (currentRound?.round_type === 'required' && players.length > 0) {
       const p = players[currentPlayerIndex % players.length]
       playerId = p.id; teamId = p.team_id; playerName = p.display_name; teamName = p.teams?.name || ''
     }
-    // For buzzer rounds, use the buzzer result
     if (currentRound?.round_type === 'buzzer' && buzzerResult) {
       playerId = buzzerResult.playerId; teamId = buzzerResult.teamId
       playerName = buzzerResult.playerDisplayId || ''; teamName = buzzerResult.teamName || ''
     }
+    if (awaitingJudge) {
+      playerId = awaitingJudge
+    }
 
-    const config = currentRound?.config || {}
-    const scoreChange = correct ? (config.scoreCorrect || q.score_value) : (config.scoreWrong || 0)
+    await applyScore(playerId, teamId, playerName, teamName, correct)
+    setBuzzerResult(null); setAwaitingJudge(null)
+  }, [questions, currentQIndex, currentRound, players, currentPlayerIndex, competition, buzzerResult, awaitingJudge])
 
-    // Save to Supabase
+  // Manual judge score for short_answer
+  const [judgeScoreValue, setJudgeScoreValue] = useState(0)
+  const submitJudgeScore = useCallback(async () => {
+    if (!awaitingJudge || !currentRound) return
+    const p = players[currentPlayerIndex % players.length]
+    if (!p) return
+    const q = questions[currentQIndex]
+    if (!q) return
+
     await supabase.from('score_records').insert({
-      competition_id: competition?.id,
-      player_id: playerId, team_id: teamId,
+      competition_id: competition?.id, player_id: p.id, team_id: p.team_id,
       round_id: currentRound?.id, question_id: q.id,
-      score_change: scoreChange,
-      reason: correct ? '正确' : (scoreChange < 0 ? '错误扣分' : '错误'),
+      score_change: judgeScoreValue,
+      reason: `评委评分: ${judgeScoreValue}/${q.score_value}`,
     })
-
-    // Reload rankings
     const rankings = await loadRankings()
-
-    // Broadcast via WS
-    send('score.confirm', {
-      playerId, teamId, scoreChange, questionId: q.id, correct,
-      playerName, teamName,
-      rankings,
-    })
+    send('score.confirm', { playerId: p.id, teamId: p.team_id, scoreChange: judgeScoreValue,
+      questionId: q.id, correct: judgeScoreValue > 0, playerName: p.display_name, teamName: p.teams?.name || '', rankings })
     send('timer.stop', {})
-    setBuzzerResult(null)
-  }, [questions, currentQIndex, currentRound, players, currentPlayerIndex, competition, buzzerResult, supabase, loadRankings])
+    setAwaitingJudge(null); setJudgeScoreValue(0)
+  }, [awaitingJudge, currentRound, players, currentPlayerIndex, questions, currentQIndex, competition, judgeScoreValue, supabase, loadRankings])
+
+  const q = currentQIndex >= 0 ? questions[currentQIndex] : null
+  const currentPlayer = currentRound?.round_type === 'required' && players.length > 0 ? players[currentPlayerIndex % players.length] : null
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -212,7 +256,7 @@ export default function ControlPage() {
 
       {!competition ? (
         <div className="bg-white rounded-xl shadow-sm border p-12 text-center">
-          <p className="text-gray-500 text-lg">暂无可用的比赛。请先在比赛管理中创建比赛。</p>
+          <p className="text-gray-500 text-lg">暂无可用的比赛。</p>
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -238,34 +282,42 @@ export default function ControlPage() {
             {currentRound && (
               <div className="bg-white rounded-xl shadow-sm border p-6">
                 <div className="flex items-center justify-between mb-4">
-                  <h3 className="font-bold">
-                    📖 题目控制 <span className="text-gray-500 font-normal ml-2">{currentQIndex + 1} / {questions.length}</span>
-                  </h3>
+                  <h3 className="font-bold">📖 题目控制 <span className="text-gray-500 font-normal ml-2">{currentQIndex + 1} / {questions.length}</span></h3>
                   <div className="flex items-center gap-2 text-sm text-gray-500">
                     <Clock className="w-4 h-4" />
                     <span className={`font-mono text-lg font-bold ${timerStatus === 'running' && remainingSec <= 3 ? 'text-red-600 animate-pulse' : ''}`}>
-                      {remainingSec.toFixed(0)}s
+                      {Math.ceil(remainingSec)}s
                     </span>
                     <span className="text-xs">({timerStatus})</span>
                   </div>
                 </div>
 
-                {currentQIndex >= 0 && questions[currentQIndex] && (
+                {/* Current Player Info */}
+                {currentRound.round_type === 'required' && currentPlayer && (
+                  <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4">
+                    <p className="text-blue-800 font-medium">
+                      当前选手：{currentPlayer.display_name} ({currentPlayer.teams?.name})
+                    </p>
+                  </div>
+                )}
+
+                {/* Question Preview */}
+                {q && (
                   <div className="bg-gray-50 rounded-lg p-4 mb-4">
                     <span className="text-xs font-medium text-blue-600 mb-1 block">
-                      {questions[currentQIndex].type === 'choice' ? '选择题' :
-                       questions[currentQIndex].type === 'true_false' ? '判断题' :
-                       questions[currentQIndex].type === 'fill_blank' ? '填空题' : '简答题'}
-                      {' · '}{questions[currentQIndex].score_value}分
-                      {' · 时限：'}{getTimeLimit(currentRound, questions[currentQIndex])}s
+                      {q.type === 'choice' ? '选择题' : q.type === 'true_false' ? '判断题' :
+                       q.type === 'fill_blank' ? '填空题' : '简答题'}
+                      {' · '}{q.score_value}分 · 时限：{getTimeLimit(currentRound, q)}s
+                      {q.type !== 'short_answer' && <span className="ml-2 text-green-600">【系统自动判分】</span>}
+                      {q.type === 'short_answer' && <span className="ml-2 text-amber-600">【需评委评分】</span>}
                     </span>
-                    <p className="text-lg mb-2">{questions[currentQIndex].content}</p>
-                    {questions[currentQIndex].options && (
+                    <p className="text-lg mb-2">{q.content}</p>
+                    {q.options && (
                       <div className="grid grid-cols-2 gap-1 text-sm text-gray-600">
-                        {(questions[currentQIndex].options as string[]).map((opt: string, i: number) => <span key={i}>{opt}</span>)}
+                        {(q.options as string[]).map((opt: string, i: number) => <span key={i}>{opt}</span>)}
                       </div>
                     )}
-                    <p className="text-sm text-green-600 mt-2">答案：{questions[currentQIndex].answer}</p>
+                    <p className="text-sm text-green-600 mt-2">答案：{q.answer}</p>
                   </div>
                 )}
 
@@ -275,22 +327,56 @@ export default function ControlPage() {
                   </button>
                 ) : (
                   <div className="space-y-3">
-                    {/* Score buttons for required rounds */}
-                    {currentRound.round_type === 'required' && (
-                      <div className="flex gap-3">
-                        <button onClick={() => confirmScore(true)} className="flex-1 py-3 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 flex items-center justify-center gap-2">
-                          <CheckCircle className="w-5 h-5" /> 正确 +{currentRound.config?.scoreCorrect || 10}
-                        </button>
-                        <button onClick={() => confirmScore(false)} className="flex-1 py-3 bg-red-600 text-white rounded-lg font-bold hover:bg-red-700 flex items-center justify-center gap-2">
-                          <XCircle className="w-5 h-5" /> 错误（0分）
-                        </button>
-                        <button onClick={() => confirmScore(false)} className="flex-1 py-3 bg-gray-600 text-white rounded-lg font-bold hover:bg-gray-700 flex items-center justify-center gap-2">
-                          <Clock className="w-5 h-5" /> 超时（0分）
-                        </button>
+                    {/* Required: show player answer status */}
+                    {currentRound.round_type === 'required' && currentPlayer && (
+                      <div>
+                        {awaitingJudge ? (
+                          <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg mb-2">
+                            <p className="text-amber-800 font-bold mb-2">📝 简答题需要评委评分</p>
+                            <p className="text-sm text-amber-600 mb-2">
+                              选手 {currentPlayer.display_name} 已提交答案：{playerAnswers[currentPlayer.id] || '无'}
+                            </p>
+                            <div className="flex items-center gap-3">
+                              <label className="text-sm font-medium">评分 (0-{q.score_value})：</label>
+                              <input type="number" min={0} max={q.score_value} value={judgeScoreValue}
+                                onChange={(e) => setJudgeScoreValue(parseInt(e.target.value) || 0)}
+                                className="w-20 px-3 py-1 border rounded-lg" />
+                              <button onClick={submitJudgeScore}
+                                className="px-4 py-1 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+                                确认评分
+                              </button>
+                            </div>
+                          </div>
+                        ) : playerAnswers[currentPlayer.id] ? (
+                          <div className="p-3 bg-green-50 border border-green-200 rounded-lg mb-2">
+                            <p className="text-green-700">✅ 选手已作答：{playerAnswers[currentPlayer.id]}</p>
+                            {q?.type !== 'short_answer' && (
+                              <p className="text-sm text-green-600 mt-1">系统已自动判分</p>
+                            )}
+                          </div>
+                        ) : (
+                          <p className="text-gray-500 text-sm mb-2">等待选手作答...</p>
+                        )}
+
+                        {/* Manual override buttons */}
+                        <div className="flex gap-3">
+                          <button onClick={() => manualConfirm(true)}
+                            className="flex-1 py-3 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 flex items-center justify-center gap-2">
+                            <CheckCircle className="w-5 h-5" /> 强制正确 +{currentRound.config?.scoreCorrect || q?.score_value || 10}
+                          </button>
+                          <button onClick={() => manualConfirm(false)}
+                            className="flex-1 py-3 bg-red-600 text-white rounded-lg font-bold hover:bg-red-700 flex items-center justify-center gap-2">
+                            <XCircle className="w-5 h-5" /> 强制错误 (0分)
+                          </button>
+                          <button onClick={() => manualConfirm(false)}
+                            className="flex-1 py-3 bg-gray-600 text-white rounded-lg font-bold hover:bg-gray-700 flex items-center justify-center gap-2">
+                            <Clock className="w-5 h-5" /> 超时 (0分)
+                          </button>
+                        </div>
                       </div>
                     )}
 
-                    {/* Buzzer button */}
+                    {/* Buzzer */}
                     {currentRound.round_type === 'buzzer' && (
                       <div>
                         <button onClick={openBuzzer} disabled={buzzerOpen}
@@ -304,19 +390,19 @@ export default function ControlPage() {
                             <p className="text-lg font-bold text-green-700">🎯 {buzzerResult.teamName} · {buzzerResult.playerDisplayId} 抢答成功！</p>
                             <p className="text-sm text-green-600">延迟：{buzzerResult.latencyMs}ms</p>
                             <div className="flex gap-3 mt-3">
-                              <button onClick={() => confirmScore(true)} className="flex-1 py-2 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700">答对 +{currentRound.config?.scoreCorrect || 10}</button>
-                              <button onClick={() => confirmScore(false)} className="flex-1 py-2 bg-red-600 text-white rounded-lg font-bold hover:bg-red-700">答错 {currentRound.config?.scoreWrong || -10}</button>
+                              <button onClick={() => manualConfirm(true)} className="flex-1 py-2 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700">答对 +{currentRound.config?.scoreCorrect || 10}</button>
+                              <button onClick={() => manualConfirm(false)} className="flex-1 py-2 bg-red-600 text-white rounded-lg font-bold hover:bg-red-700">答错 {currentRound.config?.scoreWrong || -10}</button>
                             </div>
                           </div>
                         )}
                       </div>
                     )}
 
-                    {/* Simulation - no timer, just navigation */}
+                    {/* Simulation */}
                     {currentRound.round_type === 'simulation' && (
                       <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg">
                         <p className="text-amber-800 font-medium">📝 模拟调解环节 — 选手现场作答，评委打分</p>
-                        <p className="text-sm text-amber-600 mt-1">无倒计时限制，选手完成调解后由评委在手机端评分</p>
+                        <p className="text-sm text-amber-600 mt-1">无倒计时限制</p>
                       </div>
                     )}
 
@@ -335,7 +421,7 @@ export default function ControlPage() {
             )}
           </div>
 
-          {/* Right: Status Panel */}
+          {/* Right Panel */}
           <div className="space-y-6">
             <div className="bg-white rounded-xl shadow-sm border p-6">
               <h3 className="font-bold mb-3">📊 状态信息</h3>
@@ -348,7 +434,7 @@ export default function ControlPage() {
               </div>
             </div>
 
-            {/* Team Rankings */}
+            {/* Rankings */}
             <div className="bg-white rounded-xl shadow-sm border p-6">
               <h3 className="font-bold mb-3">🏆 当前排名</h3>
               <div className="space-y-1 max-h-64 overflow-y-auto text-sm">
@@ -375,7 +461,7 @@ export default function ControlPage() {
               </div>
             </div>
 
-            {/* Quick Actions */}
+            {/* Actions */}
             <div className="bg-white rounded-xl shadow-sm border p-6">
               <h3 className="font-bold mb-3">⚡ 快捷操作</h3>
               <div className="space-y-2">

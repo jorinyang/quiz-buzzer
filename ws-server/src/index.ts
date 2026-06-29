@@ -215,6 +215,8 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
       broadcast('state.player_answer', {
         playerId: payload.playerId,
         teamId: payload.teamId,
+        teamName: payload.teamName || '',
+        playerName: payload.playerName || '',
         answer: payload.answer,
         questionId: payload.questionId,
       })
