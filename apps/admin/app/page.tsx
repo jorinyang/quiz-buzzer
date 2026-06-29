@@ -1,5 +1,9 @@
+'use client'
+
+import { useState, useEffect } from 'react'
 import { LayoutDashboard, Trophy, FileQuestion, Gamepad2, Users, Settings } from 'lucide-react'
 import Link from 'next/link'
+import { getSupabase } from '@quiz-buzzer/shared'
 
 const navItems = [
   { icon: LayoutDashboard, label: '仪表盘', href: '/' },
@@ -11,6 +15,17 @@ const navItems = [
 ]
 
 export default function AdminPage() {
+  const [competition, setCompetition] = useState<any>(null)
+  const [questionCount, setQuestionCount] = useState(0)
+  const supabase = getSupabase()
+
+  useEffect(() => {
+    supabase.from('competitions').select('*').order('created_at', { ascending: false }).limit(1).single()
+      .then(({ data }) => setCompetition(data))
+    supabase.from('questions').select('id', { count: 'exact', head: true })
+      .then(({ count }) => setQuestionCount(count || 0))
+  }, [])
+
   return (
     <div className="flex h-screen">
       {/* Sidebar */}
@@ -43,15 +58,25 @@ export default function AdminPage() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div className="bg-white rounded-xl shadow-sm border p-6">
               <p className="text-sm text-gray-500 mb-1">比赛状态</p>
-              <p className="text-2xl font-bold text-gray-400">未开始</p>
+              <p className={`text-2xl font-bold ${
+                competition?.status === 'active' ? 'text-green-600' :
+                competition?.status === 'finished' ? 'text-gray-600' :
+                competition?.status === 'paused' ? 'text-yellow-600' :
+                'text-gray-400'
+              }`}>
+                {competition?.status === 'active' ? '进行中' :
+                 competition?.status === 'finished' ? '已结束' :
+                 competition?.status === 'paused' ? '已暂停' : '未开始'}
+              </p>
+              {competition && <p className="text-sm text-gray-400 mt-1">{competition.name}</p>}
             </div>
             <div className="bg-white rounded-xl shadow-sm border p-6">
-              <p className="text-sm text-gray-500 mb-1">在线选手</p>
-              <p className="text-2xl font-bold">0 / 24</p>
+              <p className="text-sm text-gray-500 mb-1">队伍 / 选手</p>
+              <p className="text-2xl font-bold">8 / 24</p>
             </div>
             <div className="bg-white rounded-xl shadow-sm border p-6">
               <p className="text-sm text-gray-500 mb-1">题目总数</p>
-              <p className="text-2xl font-bold">0</p>
+              <p className="text-2xl font-bold">{questionCount}</p>
             </div>
           </div>
           <div className="bg-white rounded-xl shadow-sm border p-6">
