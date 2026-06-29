@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { Zap } from 'lucide-react'
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3080'
@@ -11,21 +11,47 @@ export default function BuzzPage() {
   const [buzzerState, setBuzzerState] = useState<'disabled' | 'ready' | 'pending' | 'success' | 'failed'>('disabled')
   const [buzzerResultText, setBuzzerResultText] = useState('')
   const [lastResult, setLastResult] = useState<string | null>(null)
+  const [playerScore, setPlayerScore] = useState(0)
+
+  // Current question state (for required rounds, player sees question and answers)
+  const [currentQuestion, setCurrentQuestion] = useState<any>(null)
+  const [roundType, setRoundType] = useState<string | null>(null)
+  const [answerSubmitted, setAnswerSubmitted] = useState(false)
+  const [selectedAnswer, setSelectedAnswer] = useState('')
+  const [fillAnswer, setFillAnswer] = useState('')
+
   const wsRef = useRef<WebSocket | null>(null)
   const stateRef = useRef(buzzerState)
   stateRef.current = buzzerState
+  const playerRef = useRef<any>(null)
+  playerRef.current = playerInfo
 
-  // Connect (in real app, this would use login data)
-  const connect = useCallback((username: string, password: string) => {
-    // Simple auth - in production, verify against Supabase
+  // Load player info
+  useEffect(() => {
+    const stored = sessionStorage.getItem('quiz_user')
+    if (stored) {
+      try { const info = JSON.parse(stored); setPlayerInfo(info); playerRef.current = info } catch(e) {}
+    }
+  }, [])
+
+  // Connect
+  useEffect(() => {
+    if (!playerInfo) return
+    connect()
+    return () => { wsRef.current?.close() }
+  }, [playerInfo])
+
+  function connect() {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return
     const ws = new WebSocket(WS_URL)
     wsRef.current = ws
 
     ws.onopen = () => {
       setConnected(true)
+      const info = playerRef.current
       ws.send(JSON.stringify({
         type: 'player.login',
-        payload: { username, competitionId: 'current' },
+        payload: { userId: info?.id, username: info?.username, teamId: info?.teamId, competitionId: 'current', role: info?.role },
         timestamp: Date.now()
       }))
     }
@@ -36,13 +62,42 @@ export default function BuzzPage() {
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
+        const info = playerRef.current
+
         switch (msg.type) {
+          case 'state.question':
+            if (msg.payload.action !== 'next') {
+              setCurrentQuestion(msg.payload)
+              setRoundType(msg.payload.roundType || null)
+              setAnswerSubmitted(false)
+              setSelectedAnswer('')
+              setFillAnswer('')
+              // Reset buzzer state
+              if (msg.payload.roundType === 'buzzer') {
+                setBuzzerState('disabled')
+                setBuzzerResultText('')
+              }
+            } else {
+              setCurrentQuestion(null)
+              setAnswerSubmitted(false)
+              setSelectedAnswer('')
+              setFillAnswer('')
+            }
+            break
+
+          case 'state.timer':
+            if (msg.payload.status === 'stopped' || msg.payload.status === 'expired') {
+              setBuzzerState('disabled')
+            }
+            break
+
           case 'state.buzzer.result':
             if (msg.payload?.status === 'open') {
               setBuzzerState('ready')
               setBuzzerResultText('')
+              setCurrentQuestion(null)
             } else if (msg.payload?.status === 'first') {
-              if (stateRef.current === 'pending') {
+              if (info && msg.payload.playerId === info.id) {
                 setBuzzerState('success')
                 setBuzzerResultText('你抢到了！请口头作答')
               } else {
@@ -53,123 +108,192 @@ export default function BuzzPage() {
               setBuzzerState('disabled')
             }
             break
+
           case 'state.score':
-            if (msg.payload?.correct !== undefined) {
-              setLastResult(msg.payload.correct ? '✅ 回答正确' : '❌ 回答错误')
+            if (info && msg.payload.playerId === info.id) {
+              if (msg.payload.correct !== undefined) {
+                setLastResult(msg.payload.correct ? '✅ 回答正确' : '❌ 回答错误')
+              }
+              if (msg.payload.scoreChange) {
+                setPlayerScore((prev) => prev + (msg.payload.scoreChange as number))
+              }
             }
             setBuzzerState('disabled')
             break
-          case 'state.question':
-            setBuzzerState('disabled')
-            setBuzzerResultText('')
-            setLastResult(null)
+
+          case 'state.round':
+            if (msg.payload.round?.roundType && msg.payload.round.roundType !== 'buzzer') {
+              setBuzzerState('disabled')
+            }
             break
         }
       } catch(e) {}
     }
-  }, [])
+  }
 
   const handleBuzz = useCallback(() => {
     if (stateRef.current !== 'ready') return
     setBuzzerState('pending')
     if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const info = playerRef.current
       wsRef.current.send(JSON.stringify({
         type: 'player.buzz',
         payload: {
-          competitionId: 'current',
-          questionId: 'current',
-          playerId: playerInfo?.id || 'unknown',
-          teamId: playerInfo?.teamId || 'unknown',
-          teamName: playerInfo?.teamName || '',
-          playerDisplayId: playerInfo?.displayId || '',
+          competitionId: 'current', questionId: 'current',
+          playerId: info?.id || 'unknown', teamId: info?.teamId || 'unknown',
+          teamName: info?.teamName || '', playerDisplayId: info?.displayId || '',
         },
         timestamp: Date.now()
       }))
     }
-  }, [playerInfo])
+  }, [])
+
+  // Submit answer for required rounds
+  const submitAnswer = useCallback((answer: string) => {
+    if (answerSubmitted || !currentQuestion) return
+    setAnswerSubmitted(true)
+    setSelectedAnswer(answer)
+    setFillAnswer(answer)
+
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const info = playerRef.current
+      wsRef.current.send(JSON.stringify({
+        type: 'player.submit_answer',
+        payload: {
+          competitionId: 'current', questionId: currentQuestion.questionId,
+          playerId: info?.id, teamId: info?.teamId, answer,
+        },
+        timestamp: Date.now()
+      }))
+    }
+  }, [answerSubmitted, currentQuestion])
+
+  if (!playerInfo) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-gray-100">
+        <div className="text-center">
+          <p className="text-xl text-gray-500 mb-4">请先登录</p>
+          <a href="/login" className="px-6 py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700">返回登录</a>
+        </div>
+      </main>
+    )
+  }
 
   return (
-    <main className="flex flex-col min-h-screen items-center justify-center p-4 bg-gray-100">
-      {/* Player Info */}
-      <div className="text-center mb-8">
-        <h1 className="text-2xl font-bold">{playerInfo?.displayName || '选手'}</h1>
-        <p className="text-gray-500 mt-1">
-          个人得分：<span className="font-bold text-xl">{playerInfo?.score || 0}</span>
+    <main className="flex flex-col min-h-screen p-4 bg-gray-100">
+      {/* Header */}
+      <div className="text-center mb-4">
+        <h1 className="text-xl font-bold">{playerInfo.teamName} · {playerInfo.displayName}</h1>
+        <p className="text-gray-500">个人得分：<span className="font-bold text-2xl">{playerScore}</span></p>
+        <p className="text-xs mt-1">
+          {connected ? '🟢 已连接' : '🔴 未连接'}
         </p>
       </div>
 
-      {/* Buzzer Button */}
-      <button
-        onClick={handleBuzz}
-        disabled={buzzerState !== 'ready'}
-        className={`w-48 h-48 rounded-full flex items-center justify-center mb-8 shadow-2xl transition-all duration-150 transform active:scale-95 ${
-          buzzerState === 'disabled' ? 'bg-gray-300 cursor-not-allowed' :
-          buzzerState === 'ready' ? 'bg-green-500 hover:bg-green-600 cursor-pointer animate-pulse shadow-green-300' :
-          buzzerState === 'pending' ? 'bg-yellow-400 animate-pulse' :
-          buzzerState === 'success' ? 'bg-amber-500 shadow-amber-300 scale-110' :
-          'bg-red-500'
-        }`}
-      >
-        <div className="text-center">
-          <Zap className={`w-12 h-12 mx-auto mb-1 ${
-            buzzerState === 'ready' ? 'text-white' : 'text-white/70'
-          }`} />
-          <span className="text-2xl font-bold text-white">
-            {buzzerState === 'disabled' ? '等待' :
-             buzzerState === 'ready' ? '抢答' :
-             buzzerState === 'pending' ? '...' :
-             buzzerState === 'success' ? '成功!' : '已抢'}
-          </span>
+      {/* Question Display (for required rounds) */}
+      {currentQuestion && roundType !== 'buzzer' && (
+        <div className="flex-1 flex flex-col items-center justify-center">
+          <div className="bg-white rounded-2xl shadow-lg p-6 w-full max-w-md text-center mb-6">
+            <span className="inline-block px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm mb-3">
+              {currentQuestion.type === 'choice' ? '选择题' : currentQuestion.type === 'true_false' ? '判断题' :
+               currentQuestion.type === 'fill_blank' ? '填空题' : '简答题'}
+              {' · '}{currentQuestion.scoreValue}分
+            </span>
+            <p className="text-lg font-bold mb-6">{currentQuestion.content}</p>
+
+            {/* Choice options */}
+            {(currentQuestion.type === 'choice') && currentQuestion.options && (
+              <div className="grid grid-cols-2 gap-3">
+                {(currentQuestion.options as string[]).map((opt: string, i: number) => (
+                  <button key={i}
+                    onClick={() => submitAnswer(opt.charAt(0))}
+                    disabled={answerSubmitted}
+                    className={`p-4 rounded-xl border-2 text-lg font-bold transition-all ${
+                      answerSubmitted
+                        ? selectedAnswer === opt.charAt(0) ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-400'
+                        : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50 active:scale-95'
+                    }`}>
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* True/False options */}
+            {currentQuestion.type === 'true_false' && (
+              <div className="grid grid-cols-2 gap-3">
+                {['T', 'F'].map(val => (
+                  <button key={val}
+                    onClick={() => submitAnswer(val)}
+                    disabled={answerSubmitted}
+                    className={`p-4 rounded-xl border-2 text-lg font-bold transition-all ${
+                      answerSubmitted
+                        ? selectedAnswer === val ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-400'
+                        : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50 active:scale-95'
+                    }`}>
+                    {val === 'T' ? '✅ 正确' : '❌ 错误'}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Fill blank / Short answer */}
+            {(currentQuestion.type === 'fill_blank' || currentQuestion.type === 'short_answer') && (
+              <div>
+                <input
+                  type="text"
+                  value={fillAnswer}
+                  onChange={(e) => setFillAnswer(e.target.value)}
+                  disabled={answerSubmitted}
+                  placeholder={currentQuestion.type === 'fill_blank' ? '输入答案...' : '输入简答内容...'}
+                  className="w-full px-4 py-3 border rounded-lg text-lg disabled:bg-gray-100"
+                />
+                <button
+                  onClick={() => submitAnswer(fillAnswer)}
+                  disabled={answerSubmitted || !fillAnswer.trim()}
+                  className="mt-3 w-full py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 disabled:opacity-50">
+                  {answerSubmitted ? '✅ 已提交' : '提交答案'}
+                </button>
+              </div>
+            )}
+
+            {answerSubmitted && (
+              <p className="mt-3 text-green-600 font-medium">✅ 答案已提交，等待主持人判定</p>
+            )}
+          </div>
         </div>
-      </button>
+      )}
 
-      {/* Status */}
-      <p className={`text-lg mb-2 font-medium ${
-        buzzerState === 'ready' ? 'text-green-600' :
-        buzzerState === 'success' ? 'text-amber-600' :
-        buzzerState === 'failed' ? 'text-red-600' :
-        'text-gray-500'
-      }`}>
-        {buzzerState === 'disabled' ? '等待抢答开始...' :
-         buzzerState === 'ready' ? '点击抢答！' :
-         buzzerState === 'pending' ? '等待结果...' :
-         buzzerResultText || ''}
-      </p>
+      {/* Buzzer Button (for buzzer rounds) */}
+      {(!currentQuestion || roundType === 'buzzer') && (
+        <div className="flex flex-col items-center justify-center flex-1">
+          <button onClick={handleBuzz} disabled={buzzerState !== 'ready'}
+            className={`w-40 h-40 rounded-full flex items-center justify-center mb-6 shadow-2xl transition-all duration-150 transform active:scale-95 ${
+              buzzerState === 'disabled' ? 'bg-gray-300 cursor-not-allowed' :
+              buzzerState === 'ready' ? 'bg-green-500 hover:bg-green-600 cursor-pointer animate-pulse shadow-green-300' :
+              buzzerState === 'pending' ? 'bg-yellow-400 animate-pulse' :
+              buzzerState === 'success' ? 'bg-amber-500 shadow-amber-300 scale-110' : 'bg-red-500'
+            }`}>
+            <div className="text-center">
+              <Zap className={`w-10 h-10 mx-auto mb-1 ${buzzerState === 'ready' ? 'text-white' : 'text-white/70'}`} />
+              <span className="text-xl font-bold text-white">
+                {buzzerState === 'disabled' ? '等待' : buzzerState === 'ready' ? '抢答' :
+                 buzzerState === 'pending' ? '...' : buzzerState === 'success' ? '成功!' : '已抢'}
+              </span>
+            </div>
+          </button>
 
-      {/* Connection Status */}
-      <p className="text-sm mb-4">
-        {connected ? '🟢 已连接' : '🔴 未连接'}
-      </p>
+          <p className={`text-lg mb-2 font-medium ${
+            buzzerState === 'ready' ? 'text-green-600' : buzzerState === 'success' ? 'text-amber-600' :
+            buzzerState === 'failed' ? 'text-red-600' : 'text-gray-500'}`}>
+            {buzzerState === 'disabled' ? '等待抢答开始...' : buzzerState === 'ready' ? '点击抢答！' :
+             buzzerState === 'pending' ? '等待结果...' : buzzerResultText || ''}
+          </p>
 
-      {/* Last Result */}
-      <div className="w-64 text-center p-4 rounded-xl bg-white shadow-sm">
-        <p className="text-sm text-gray-400 mb-1">上一题结果</p>
-        <p className="text-lg font-medium">{lastResult || '暂无'}</p>
-      </div>
-
-      {/* Login Form (simple) */}
-      {!playerInfo && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-2xl shadow-xl p-8 w-80">
-            <h2 className="text-xl font-bold mb-4 text-center">选手登录</h2>
-            <form onSubmit={(e) => {
-              e.preventDefault()
-              const form = e.target as HTMLFormElement
-              const username = (form.elements.namedItem('username') as HTMLInputElement).value
-              const password = (form.elements.namedItem('password') as HTMLInputElement).value
-              setPlayerInfo({ username, score: 0 })
-              connect(username, password)
-            }} className="space-y-4">
-              <div>
-                <input name="username" type="text" placeholder="选手编号" className="w-full px-4 py-3 border rounded-lg" required />
-              </div>
-              <div>
-                <input name="password" type="password" placeholder="密码" className="w-full px-4 py-3 border rounded-lg" required />
-              </div>
-              <button type="submit" className="w-full py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700">
-                进入抢答
-              </button>
-            </form>
+          {/* Last Result */}
+          <div className="w-64 text-center p-4 rounded-xl bg-white shadow-sm mt-4">
+            <p className="text-sm text-gray-400 mb-1">结果</p>
+            <p className="text-lg font-medium">{lastResult || '暂无'}</p>
           </div>
         </div>
       )}

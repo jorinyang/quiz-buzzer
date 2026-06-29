@@ -27,6 +27,13 @@ interface WsMessage {
 
 // ---------- State ----------
 const clients = new Map<WebSocket, Client>()
+
+// Timer state
+let timerInterval: ReturnType<typeof setInterval> | null = null
+let timerRemaining = 0
+let timerTotal = 0
+
+// Buzzer state
 let activeBuzzer: {
   competitionId: string
   questionId: string
@@ -34,6 +41,35 @@ let activeBuzzer: {
   responses: Array<{ playerId: string; teamId: string; teamName: string; latencyMs: number; ws: WebSocket }>
   isOpen: boolean
 } | null = null
+
+// ---------- Timer Engine ----------
+function startTimer(durationSec: number) {
+  stopTimer()
+  timerRemaining = durationSec
+  timerTotal = durationSec
+
+  broadcast('state.timer', { remainingSec: timerRemaining, totalSec: timerTotal, status: 'running' })
+
+  timerInterval = setInterval(() => {
+    timerRemaining -= 0.1
+    if (timerRemaining <= 0) {
+      timerRemaining = 0
+      broadcast('state.timer', { remainingSec: 0, totalSec: timerTotal, status: 'expired' })
+      stopTimer()
+      return
+    }
+    // Broadcast tick every second for display sync
+    broadcast('state.timer', { remainingSec: timerRemaining, totalSec: timerTotal, status: 'running' })
+  }, 1000) // tick every 1s for display, fine enough for visual countdown
+}
+
+function stopTimer() {
+  if (timerInterval) {
+    clearInterval(timerInterval)
+    timerInterval = null
+  }
+  broadcast('state.timer', { remainingSec: timerRemaining, totalSec: timerTotal, status: 'stopped' })
+}
 
 // ---------- Helpers ----------
 function broadcast(type: string, payload: Record<string, unknown>, filter?: (c: Client) => boolean) {
@@ -71,16 +107,19 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
       break
 
     case 'competition.finish':
+      stopTimer()
       broadcast('state.competition', { status: 'finished' })
       broadcast('state.competition.finish', payload)
       break
 
     case 'round.start':
+      stopTimer()
+      activeBuzzer = null
       broadcast('state.round', { round: payload, status: 'active' })
       break
 
     case 'round.finish':
-      broadcast('state.round', { status: 'finished' })
+      stopTimer()
       if (payload.rankings) {
         broadcast('state.round.results', { roundId: payload.roundId, rankings: payload.rankings })
       }
@@ -95,10 +134,13 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
         scoreValue: payload.scoreValue,
         playerId: payload.playerId || null,
         playerDisplayId: payload.playerDisplayId || null,
+        roundType: payload.roundType || null,
       })
       break
 
     case 'question.next':
+      stopTimer()
+      activeBuzzer = null
       broadcast('state.question', { action: 'next', questionIndex: payload.questionIndex, totalQuestions: payload.totalQuestions })
       break
 
@@ -110,13 +152,14 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
         responses: [],
         isOpen: true,
       }
-      broadcast('state.timer', { remainingSec: 10, totalSec: 10, status: 'running' })
+      startTimer(payload.durationSec as number || 10)
       broadcast('state.buzzer.result', { status: 'open', startTime: activeBuzzer.startTime })
       break
 
     case 'buzzer.close':
       if (activeBuzzer) activeBuzzer.isOpen = false
       activeBuzzer = null
+      stopTimer()
       broadcast('state.buzzer.result', { status: 'closed' })
       break
 
@@ -127,28 +170,31 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
         scoreChange: payload.scoreChange,
         reason: payload.reason,
       })
-      // Also trigger ranking update
       if (payload.rankings) {
         broadcast('state.ranking', { rankings: payload.rankings })
       }
       break
 
     case 'score.confirm':
+      stopTimer()
       broadcast('state.score', {
         playerId: payload.playerId,
         teamId: payload.teamId,
-        scoreChange: payload.correct ? (payload.scoreValue || 10) : (payload.penaltyValue || 0),
+        scoreChange: payload.scoreChange,
         questionId: payload.questionId,
         correct: payload.correct,
       })
+      if (payload.rankings) {
+        broadcast('state.ranking', { rankings: payload.rankings })
+      }
       break
 
     case 'timer.start':
-      broadcast('state.timer', { remainingSec: payload.durationSec, totalSec: payload.durationSec, status: 'running' })
+      startTimer(payload.durationSec as number || 10)
       break
 
     case 'timer.stop':
-      broadcast('state.timer', { remainingSec: 0, totalSec: payload.durationSec || 10, status: 'stopped' })
+      stopTimer()
       break
 
     case 'judge.start':
@@ -157,11 +203,21 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
 
     // --- Player Events ---
     case 'player.login':
-      client.type = 'player'
+      client.type = payload.role === 'judge' ? 'judge' : 'player'
       client.userId = payload.userId as string
       client.teamId = payload.teamId as string
       client.competitionId = payload.competitionId as string
       sendTo(ws, 'player.login', { success: true, userId: client.userId })
+      break
+
+    case 'player.submit_answer':
+      // Player submitted answer for required rounds (choice/tf/fill/short)
+      broadcast('state.player_answer', {
+        playerId: payload.playerId,
+        teamId: payload.teamId,
+        answer: payload.answer,
+        questionId: payload.questionId,
+      })
       break
 
     case 'player.buzz':
@@ -173,7 +229,6 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
       const now = Date.now()
       const latencyMs = now - activeBuzzer.startTime
 
-      // Check for early buzz (negative latency = before open)
       if (latencyMs < 0) {
         sendTo(ws, 'state.buzzer.violation', {
           playerId: payload.playerId,
@@ -190,12 +245,8 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
         return
       }
 
-      // Check for duplicate
-      if (activeBuzzer.responses.some(r => r.playerId === payload.playerId)) {
-        return // ignore duplicate clicks
-      }
+      if (activeBuzzer.responses.some(r => r.playerId === payload.playerId)) return
 
-      // Record response
       const response = {
         playerId: payload.playerId as string,
         teamId: payload.teamId as string,
@@ -205,11 +256,10 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
       }
       activeBuzzer.responses.push(response)
 
-      // Determine rank
       const rank = activeBuzzer.responses.length
 
       if (rank === 1) {
-        // First buzzer!
+        stopTimer()
         broadcast('state.buzzer.result', {
           playerId: response.playerId,
           teamId: response.teamId,
@@ -220,7 +270,6 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
           status: 'first',
         })
       } else {
-        // Not first
         sendTo(ws, 'state.buzzer.result', {
           playerId: response.playerId,
           teamId: response.teamId,
@@ -276,7 +325,6 @@ wss.on('connection', (ws: WebSocket) => {
     clients.delete(ws)
   })
 
-  // Send initial state
   sendTo(ws, 'state.competition', {
     status: 'connected',
     message: '已连接到抢答服务',
@@ -284,14 +332,8 @@ wss.on('connection', (ws: WebSocket) => {
   })
 })
 
-// Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\nShutting down...')
-  wss.close()
-  process.exit(0)
-})
-
-process.on('SIGTERM', () => {
   wss.close()
   process.exit(0)
 })
