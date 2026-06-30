@@ -82,9 +82,12 @@ export default function BuzzPage() {
             } else if (msg.payload?.status === 'closed') { setBuzzerState('disabled') }
             break
           case 'state.score':
-            if (info && msg.payload.playerId === info.id) {
-              if (msg.payload.correct !== undefined) setLastResult(msg.payload.correct ? '✅ 回答正确' : '❌ 回答错误')
-              if (msg.payload.scoreChange) setPlayerScore((prev: number) => prev + (msg.payload.scoreChange as number))
+            {
+              const pid = msg.payload.playerId
+              if (info && pid === info.id) {
+                if (msg.payload.correct !== undefined) setLastResult(msg.payload.correct ? '✅ 回答正确' : '❌ 回答错误')
+                if (msg.payload.scoreChange) setPlayerScore((prev: number) => prev + (msg.payload.scoreChange as number))
+              }
             }
             setBuzzerState('disabled'); setIsBuzzerWinner(false)
             break

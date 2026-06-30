@@ -176,12 +176,15 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
 
     case 'score.confirm':
       stopTimer()
+      // Broadcast score to ALL clients — player clients filter by playerId
       broadcast('state.score', {
         playerId: payload.playerId,
         teamId: payload.teamId,
         scoreChange: payload.scoreChange,
         questionId: payload.questionId,
         correct: payload.correct,
+        playerName: payload.playerName,
+        teamName: payload.teamName,
       })
       if (payload.rankings) {
         broadcast('state.ranking', { rankings: payload.rankings })
