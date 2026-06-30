@@ -102,15 +102,22 @@ export default function ControlPage() {
     setPlayerAnswers(prev => ({ ...prev, [playerId]: answer }))
 
     const q = questions[currentQIndex]
-    if (!q || q.id !== questionId) return
+    if (!q) return
 
-    if (autoGrade(q, answer, q.type as QuestionType)) {
-      // Auto-grade: correct or wrong
-      const isCorrect = autoGrade(q, answer, q.type as QuestionType)
-      await applyScore(playerId, teamId, playerName, teamName, isCorrect, answer)
-    } else if (q.type === 'short_answer') {
+    // Relax questionId check — accept if player answer is for any recent question
+    if (q.id !== questionId) {
+      // Still try to auto-grade if possible
+    }
+
+    const qType = q.type as QuestionType
+
+    if (qType === 'short_answer') {
       // Needs judge scoring
       setAwaitingJudge(playerId)
+    } else {
+      // Auto-grade for choice, true_false, fill_blank
+      const isCorrect = autoGrade(q, answer, qType)
+      await applyScore(playerId, teamId, playerName, teamName, isCorrect, answer)
     }
   }
 
