@@ -119,24 +119,39 @@ export default function ControlPage() {
     const q = questions[currentQIndex]
     if (!q) return
     const config = currentRound?.config || {}
-    const scoreChange = correct ? (config.scoreCorrect || q.score_value) : 0
+    const isBuzzer = currentRound?.round_type === 'buzzer'
+    // 必答: 正确=+10, 错误=0.  抢答: 正确=+10, 错误=-10.
+    const scoreChange = correct
+      ? (config.scoreCorrect || q.score_value)
+      : (isBuzzer ? (config.scoreWrong || -10) : 0)
 
-    // Save to Supabase
+    // Save player score record
     await supabase.from('score_records').insert({
       competition_id: competition?.id,
       player_id: playerId, team_id: teamId,
       round_id: currentRound?.id, question_id: q.id,
       score_change: scoreChange,
-      reason: correct ? `正确 (${answer || ''})` : `错误 (${answer || ''})`,
+      reason: correct ? `正确 (${answer || ''})` : (isBuzzer ? `错误 (${answer || ''}) 扣分` : `错误 (${answer || ''})`),
     })
+
+    // 必答正确且非抢答: 团队也加10分 (队员得分已记录, 团队需要单独的记录)
+    // 抢答: 团队分已经通过玩家分体现(抢答score属于team), 不需要额外记录
+    if (correct && !isBuzzer) {
+      await supabase.from('score_records').insert({
+        competition_id: competition?.id,
+        player_id: playerId, team_id: teamId,
+        round_id: currentRound?.id, question_id: q.id,
+        score_change: config.scoreCorrect || q.score_value,
+        reason: `团队加分 (${playerName || ''} 正确)`,
+      })
+    }
 
     const rankings = await loadRankings()
 
-    // Broadcast via WS — playerId ensures only that player sees score change
-    send('score.confirm', { playerId, teamId, scoreChange, questionId: q.id, correct,
+    send('score.confirm', { playerId, teamId, scoreChange: correct ? (config.scoreCorrect || q.score_value) : (isBuzzer ? (config.scoreWrong || -10) : 0), questionId: q.id, correct,
       playerName, teamName, rankings })
 
-    // Also broadcast timer stop (stop the countdown display)
+    // Broadcast timer stop
     send('timer.stop', {})
 
     // Update local timer state

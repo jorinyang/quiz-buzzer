@@ -234,15 +234,16 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
         sendTo(ws, 'state.buzzer.violation', {
           playerId: payload.playerId,
           teamId: payload.teamId,
-          reason: '提前抢答！',
+          reason: '提前抢答！该队取消本题资格',
         })
         broadcast('state.buzzer.violation', {
           playerId: payload.playerId,
           teamId: payload.teamId,
           teamName: payload.teamName || '',
-          reason: '提前抢答！',
+          reason: '提前抢答！该队取消本题资格',
           playerDisplayId: payload.playerDisplayId || '',
         })
+        // Don't return here — let the client also know that this player is disqualified
         return
       }
 
