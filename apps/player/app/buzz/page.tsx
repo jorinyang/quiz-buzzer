@@ -43,6 +43,14 @@ export default function BuzzPage() {
 
     ws.onopen = () => {
       setConnected(true)
+      // Re-read from sessionStorage to ensure playerRef is populated
+      const stored = sessionStorage.getItem('quiz_user')
+      if (stored) {
+        try {
+          const parsed = JSON.parse(stored)
+          playerRef.current = parsed
+        } catch(e) {}
+      }
       const info = playerRef.current
       ws.send(JSON.stringify({ type: 'player.login', payload: { userId: info?.id, username: info?.username, teamId: info?.teamId, competitionId: 'current', role: info?.role }, timestamp: Date.now() }))
     }
