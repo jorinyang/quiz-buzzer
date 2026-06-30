@@ -51,16 +51,15 @@ function startTimer(durationSec: number) {
   broadcast('state.timer', { remainingSec: timerRemaining, totalSec: timerTotal, status: 'running' })
 
   timerInterval = setInterval(() => {
-    timerRemaining -= 0.1
+    timerRemaining -= 1
     if (timerRemaining <= 0) {
       timerRemaining = 0
       broadcast('state.timer', { remainingSec: 0, totalSec: timerTotal, status: 'expired' })
       stopTimer()
       return
     }
-    // Broadcast tick every second for display sync
     broadcast('state.timer', { remainingSec: timerRemaining, totalSec: timerTotal, status: 'running' })
-  }, 1000) // tick every 1s for display, fine enough for visual countdown
+  }, 1000)
 }
 
 function stopTimer() {

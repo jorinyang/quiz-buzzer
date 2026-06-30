@@ -11,13 +11,11 @@ type QuestionType = 'choice' | 'true_false' | 'fill_blank' | 'short_answer'
 function getTimeLimit(round: any, question: any): number {
   if (round?.round_type === 'simulation') return 0
   if (round?.config?.timeLimit) return round.config.timeLimit
-  if (!question) return 10
   const limits: Record<QuestionType, number> = { choice: 10, true_false: 5, fill_blank: 15, short_answer: 30 }
-  return limits[question.type as QuestionType] || 10
+  return limits[question?.type as QuestionType] || 10
 }
 
 function autoGrade(question: any, answer: string, qType: QuestionType): boolean {
-  // Only short_answer always goes to judge
   if (qType === 'short_answer') return false
   const correct = question.answer?.toString().trim().toUpperCase()
   const given = answer?.toString().trim().toUpperCase()
@@ -38,43 +36,44 @@ export default function ControlPage() {
   const [buzzerResult, setBuzzerResult] = useState<any>(null)
   const [connected, setConnected] = useState(false)
   const [teamRankings, setTeamRankings] = useState<any[]>([])
+  const [playerTotals, setPlayerTotals] = useState<Record<string, number>>({})
   const [playerAnswers, setPlayerAnswers] = useState<Record<string, string>>({})
-  const [awaitingJudge, setAwaitingJudge] = useState<string | null>(null) // playerId waiting for judge score
+  const [awaitingJudge, setAwaitingJudge] = useState<string | null>(null)
 
   const wsRef = useRef<WebSocket | null>(null)
   const supabase = getSupabase()
 
-  // Load competition
   useEffect(() => {
     supabase.from('competitions').select('*, rounds(*)').order('created_at', { ascending: false }).limit(1).single()
       .then(({ data }) => { if (data) { setCompetition(data); setRounds(data.rounds || []) } })
-  }, [])
-
-  // Load players
-  useEffect(() => {
     supabase.from('users').select('*, teams(name)').eq('role', 'player').order('created_at')
       .then(({ data }) => setPlayers(data || []))
   }, [])
 
-  // Connect WS
   useEffect(() => { connectWs(); return () => { wsRef.current?.close() } }, [])
 
   const loadRankings = useCallback(async () => {
-    const { data: teams } = await supabase.from('teams').select('id, name')
-    const { data: scores } = await supabase.from('score_records').select('team_id, score_change')
-    const map = new Map<string, number>()
-    for (const s of (scores || [])) map.set(s.team_id, (map.get(s.team_id) || 0) + s.score_change)
-    const rankings = (teams || []).map(t => ({ teamId: t.id, teamName: t.name, score: map.get(t.id) || 0 }))
+    const [teamsRes, scoresRes] = await Promise.all([
+      supabase.from('teams').select('id, name'),
+      supabase.from('score_records').select('team_id, player_id, score_change'),
+    ])
+    const teamMap = new Map<string, number>()
+    const playerMap: Record<string, number> = {}
+    for (const s of (scoresRes.data || [])) {
+      teamMap.set(s.team_id, (teamMap.get(s.team_id) || 0) + s.score_change)
+      playerMap[s.player_id] = (playerMap[s.player_id] || 0) + s.score_change
+    }
+    const rankings = (teamsRes.data || []).map(t => ({ teamId: t.id, teamName: t.name, score: teamMap.get(t.id) || 0 }))
       .sort((a: any, b: any) => b.score - a.score)
     setTeamRankings(rankings)
+    setPlayerTotals(playerMap)
     return rankings
   }, [supabase])
 
   useEffect(() => { loadRankings() }, [loadRankings])
 
   function connectWs() {
-    const ws = new WebSocket(WS_URL)
-    wsRef.current = ws
+    const ws = new WebSocket(WS_URL); wsRef.current = ws
     ws.onopen = () => setConnected(true)
     ws.onclose = () => { setConnected(false); setTimeout(connectWs, 2000) }
     ws.onmessage = (event) => {
@@ -86,12 +85,9 @@ export default function ControlPage() {
             setTimerStatus(msg.payload.status as string)
             break
           case 'state.buzzer.result':
-            if (msg.payload?.status === 'first') {
-              onBuzzerResult(msg.payload)
-            }
+            if (msg.payload?.status === 'first') onBuzzerResult(msg.payload)
             break
           case 'state.player_answer':
-            // Receive player answer, auto-grade if possible
             handlePlayerAnswer(msg.payload)
             break
         }
@@ -99,25 +95,21 @@ export default function ControlPage() {
     }
   }
 
-  async function handlePlayerAnswer(payload: any) {
-    const { playerId, teamId, teamName, playerName, answer, questionId } = payload
-    setPlayerAnswers(prev => ({ ...prev, [playerId]: answer }))
+  function send(type: string, payload: any = {}) {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type, payload, timestamp: Date.now() }))
+    }
+  }
 
+  async function handlePlayerAnswer(payload: any) {
+    const { playerId, teamId, teamName, playerName, answer } = payload
+    setPlayerAnswers(prev => ({ ...prev, [playerId]: answer }))
     const q = questions[currentQIndex]
     if (!q) return
-
-    // Relax questionId check — accept if player answer is for any recent question
-    if (q.id !== questionId) {
-      // Still try to auto-grade if possible
-    }
-
     const qType = q.type as QuestionType
-
     if (qType === 'short_answer') {
-      // Needs judge scoring
       setAwaitingJudge(playerId)
     } else {
-      // Auto-grade for choice, true_false, fill_blank
       const isCorrect = autoGrade(q, answer, qType)
       await applyScore(playerId, teamId, playerName, teamName, isCorrect, answer)
     }
@@ -127,7 +119,7 @@ export default function ControlPage() {
     const q = questions[currentQIndex]
     if (!q) return
     const config = currentRound?.config || {}
-    const scoreChange = correct ? (config.scoreCorrect || q.score_value) : 0 // no penalty in required
+    const scoreChange = correct ? (config.scoreCorrect || q.score_value) : 0
 
     // Save to Supabase
     await supabase.from('score_records').insert({
@@ -139,14 +131,16 @@ export default function ControlPage() {
     })
 
     const rankings = await loadRankings()
-    send('score.confirm', { playerId, teamId, scoreChange, questionId: q.id, correct, playerName, teamName, rankings })
-    send('timer.stop', {})
-  }
 
-  function send(type: string, payload: any = {}) {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type, payload, timestamp: Date.now() }))
-    }
+    // Broadcast via WS — playerId ensures only that player sees score change
+    send('score.confirm', { playerId, teamId, scoreChange, questionId: q.id, correct,
+      playerName, teamName, rankings })
+
+    // Also broadcast timer stop (stop the countdown display)
+    send('timer.stop', {})
+
+    // Update local timer state
+    setTimerStatus('stopped')
   }
 
   const selectRound = useCallback(async (round: any) => {
@@ -181,16 +175,14 @@ export default function ControlPage() {
     if (currentRound?.round_type !== 'simulation' && limit > 0) {
       send('timer.start', { durationSec: limit })
     }
-    // For buzzer rounds, question is shown to admin only, NOT to players yet
-    // Players get question only after they buzz successfully
   }, [questions, currentRound, players, currentPlayerIndex, competition])
 
   const nextQuestion = useCallback(() => {
     const next = currentQIndex + 1
     if (next >= questions.length) { alert('当前环节题目已用完'); return }
-    setBuzzerResult(null); setBuzzerOpen(false)
-    setPlayerAnswers({}); setAwaitingJudge(null)
-    setTimerStatus('stopped'); send('timer.stop', {})
+    send('timer.stop', {})
+    setBuzzerResult(null); setBuzzerOpen(false); setPlayerAnswers({}); setAwaitingJudge(null)
+    setTimerStatus('stopped')
     if (currentRound?.round_type === 'required') {
       setCurrentPlayerIndex((prev: number) => (prev + 1) % players.length)
     }
@@ -202,20 +194,13 @@ export default function ControlPage() {
     if (!q) return
     setBuzzerOpen(true); setBuzzerResult(null); setPlayerAnswers({})
     const limit = getTimeLimit(currentRound, q)
-    // Send buzzer open WITHOUT question content — players only see "抢答" button
-    // Question content is sent to ALL after a player wins the buzzer
     send('buzzer.open', { competitionId: competition?.id, questionId: q.id, durationSec: limit })
   }, [questions, currentQIndex, competition, currentRound])
 
-  // When a player wins the buzzer, send question to ALL players so winner can answer
   const onBuzzerResult = useCallback((result: any) => {
-    setBuzzerResult(result)
-    setBuzzerOpen(false)
-
+    setBuzzerResult(result); setBuzzerOpen(false)
     const q = questions[currentQIndex]
     if (!q) return
-
-    // Send question to ALL players so the winner (and others) see the question + options
     send('question.show', {
       competitionId: competition?.id, questionId: q.id, content: q.content, type: q.type,
       options: q.options, scoreValue: q.score_value,
@@ -224,12 +209,11 @@ export default function ControlPage() {
     })
   }, [questions, currentQIndex, competition])
 
-  // Manual confirm for operator (buzzer rounds, or operator override)
+  // Manual confirm — scoped to current player (required) or buzzer winner
   const manualConfirm = useCallback(async (correct: boolean) => {
     const q = questions[currentQIndex]
     if (!q) return
-    let playerId = 'unknown', teamId = 'unknown', playerName = 'unknown', teamName = 'unknown'
-
+    let playerId = '', teamId = '', playerName = '', teamName = ''
     if (currentRound?.round_type === 'required' && players.length > 0) {
       const p = players[currentPlayerIndex % players.length]
       playerId = p.id; teamId = p.team_id; playerName = p.display_name; teamName = p.teams?.name || ''
@@ -238,15 +222,12 @@ export default function ControlPage() {
       playerId = buzzerResult.playerId; teamId = buzzerResult.teamId
       playerName = buzzerResult.playerDisplayId || ''; teamName = buzzerResult.teamName || ''
     }
-    if (awaitingJudge) {
-      playerId = awaitingJudge
-    }
-
+    if (awaitingJudge) playerId = awaitingJudge
+    if (!playerId) return
     await applyScore(playerId, teamId, playerName, teamName, correct)
     setBuzzerResult(null); setAwaitingJudge(null)
   }, [questions, currentQIndex, currentRound, players, currentPlayerIndex, competition, buzzerResult, awaitingJudge])
 
-  // Manual judge score for short_answer
   const [judgeScoreValue, setJudgeScoreValue] = useState(0)
   const submitJudgeScore = useCallback(async () => {
     if (!awaitingJudge || !currentRound) return
@@ -254,7 +235,6 @@ export default function ControlPage() {
     if (!p) return
     const q = questions[currentQIndex]
     if (!q) return
-
     await supabase.from('score_records').insert({
       competition_id: competition?.id, player_id: p.id, team_id: p.team_id,
       round_id: currentRound?.id, question_id: q.id,
@@ -265,7 +245,7 @@ export default function ControlPage() {
     send('score.confirm', { playerId: p.id, teamId: p.team_id, scoreChange: judgeScoreValue,
       questionId: q.id, correct: judgeScoreValue > 0, playerName: p.display_name, teamName: p.teams?.name || '', rankings })
     send('timer.stop', {})
-    setAwaitingJudge(null); setJudgeScoreValue(0)
+    setAwaitingJudge(null); setJudgeScoreValue(0); setTimerStatus('stopped')
   }, [awaitingJudge, currentRound, players, currentPlayerIndex, questions, currentQIndex, competition, judgeScoreValue, supabase, loadRankings])
 
   const q = currentQIndex >= 0 ? questions[currentQIndex] : null
@@ -275,143 +255,99 @@ export default function ControlPage() {
     <div className="max-w-6xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-3xl font-bold">🎮 比赛控制台</h2>
-        <span className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm font-medium ${
-          connected ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-          {connected ? '🟢 已连接' : '🔴 未连接'} · {WS_URL}
-        </span>
+        <span className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm font-medium ${connected ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+          {connected ? '🟢 已连接' : '🔴 未连接'} · {WS_URL}</span>
       </div>
 
       {!competition ? (
-        <div className="bg-white rounded-xl shadow-sm border p-12 text-center">
-          <p className="text-gray-500 text-lg">暂无可用的比赛。</p>
-        </div>
+        <div className="bg-white rounded-xl shadow-sm border p-12 text-center"><p className="text-gray-500 text-lg">暂无可用的比赛。</p></div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-6">
-            {/* Round Selection */}
             <div className="bg-white rounded-xl shadow-sm border p-6">
               <h3 className="font-bold mb-3">📋 选择环节</h3>
               <div className="flex gap-3 flex-wrap">
                 {rounds.map((r: any) => (
-                  <button key={r.id} onClick={() => selectRound(r)}
-                    className={`px-4 py-3 rounded-lg border-2 text-left transition-colors ${
-                      currentRound?.id === r.id ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}>
+                  <button key={r.id} onClick={() => selectRound(r)} className={`px-4 py-3 rounded-lg border-2 text-left transition-colors ${currentRound?.id === r.id ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}>
                     <div className="font-bold">{r.round_order}. {r.title.split(' - ')[0]}</div>
-                    <div className="text-xs text-gray-500 mt-1">
-                      {r.round_type === 'required' ? '必答' : r.round_type === 'buzzer' ? '抢答' : '模拟调解'}
-                    </div>
+                    <div className="text-xs text-gray-500 mt-1">{r.round_type === 'required' ? '必答' : r.round_type === 'buzzer' ? '抢答' : '模拟调解'}</div>
                   </button>
                 ))}
               </div>
             </div>
 
-            {/* Question Control */}
             {currentRound && (
               <div className="bg-white rounded-xl shadow-sm border p-6">
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="font-bold">📖 题目控制 <span className="text-gray-500 font-normal ml-2">{currentQIndex + 1} / {questions.length}</span></h3>
-                  <div className="flex items-center gap-2 text-sm text-gray-500">
+                  <div className="flex items-center gap-2 text-sm">
                     <Clock className="w-4 h-4" />
                     <span className={`font-mono text-lg font-bold ${timerStatus === 'running' && remainingSec <= 3 ? 'text-red-600 animate-pulse' : ''}`}>
-                      {Math.ceil(remainingSec)}s
-                    </span>
-                    <span className="text-xs">({timerStatus})</span>
+                      {Math.ceil(remainingSec)}s</span>
+                    <span className="text-xs text-gray-400">({timerStatus})</span>
                   </div>
                 </div>
 
-                {/* Current Player Info */}
                 {currentRound.round_type === 'required' && currentPlayer && (
                   <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4">
-                    <p className="text-blue-800 font-medium">
-                      当前选手：{currentPlayer.display_name} ({currentPlayer.teams?.name})
-                    </p>
+                    <p className="text-blue-800 font-medium">当前选手：{currentPlayer.display_name} ({currentPlayer.teams?.name}) · 总分：{playerTotals[currentPlayer.id] || 0}</p>
                   </div>
                 )}
 
-                {/* Question Preview */}
                 {q && (
                   <div className="bg-gray-50 rounded-lg p-4 mb-4">
                     <span className="text-xs font-medium text-blue-600 mb-1 block">
-                      {q.type === 'choice' ? '选择题' : q.type === 'true_false' ? '判断题' :
-                       q.type === 'fill_blank' ? '填空题' : '简答题'}
+                      {q.type === 'choice' ? '选择题' : q.type === 'true_false' ? '判断题' : q.type === 'fill_blank' ? '填空题' : '简答题'}
                       {' · '}{q.score_value}分 · 时限：{getTimeLimit(currentRound, q)}s
                       {q.type !== 'short_answer' && <span className="ml-2 text-green-600">【系统自动判分】</span>}
                       {q.type === 'short_answer' && <span className="ml-2 text-amber-600">【需评委评分】</span>}
                     </span>
                     <p className="text-lg mb-2">{q.content}</p>
-                    {q.options && (
-                      <div className="grid grid-cols-2 gap-1 text-sm text-gray-600">
-                        {(q.options as string[]).map((opt: string, i: number) => <span key={i}>{opt}</span>)}
-                      </div>
-                    )}
+                    {q.options && <div className="grid grid-cols-2 gap-1 text-sm text-gray-600">{(q.options as string[]).map((opt: string, i: number) => <span key={i}>{opt}</span>)}</div>}
                     <p className="text-sm text-green-600 mt-2">答案：{q.answer}</p>
                   </div>
                 )}
 
                 {currentQIndex < 0 ? (
-                  <button onClick={() => showQuestion(0)} className="w-full py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700">
-                    开始答题 · 显示第1题
-                  </button>
+                  <button onClick={() => showQuestion(0)} className="w-full py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700">开始答题 · 显示第1题</button>
                 ) : (
                   <div className="space-y-3">
-                    {/* Required: show player answer status */}
                     {currentRound.round_type === 'required' && currentPlayer && (
                       <div>
                         {awaitingJudge ? (
                           <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg mb-2">
-                            <p className="text-amber-800 font-bold mb-2">📝 简答题需要评委评分</p>
-                            <p className="text-sm text-amber-600 mb-2">
-                              选手 {currentPlayer.display_name} 已提交答案：{playerAnswers[currentPlayer.id] || '无'}
-                            </p>
+                            <p className="text-amber-800 font-bold mb-2">📝 {currentPlayer.display_name} 简答题需要评委评分</p>
+                            <p className="text-sm text-amber-600 mb-2">答案：{playerAnswers[currentPlayer.id] || '无'}</p>
                             <div className="flex items-center gap-3">
-                              <label className="text-sm font-medium">评分 (0-{q.score_value})：</label>
-                              <input type="number" min={0} max={q.score_value} value={judgeScoreValue}
-                                onChange={(e) => setJudgeScoreValue(parseInt(e.target.value) || 0)}
-                                className="w-20 px-3 py-1 border rounded-lg" />
-                              <button onClick={submitJudgeScore}
-                                className="px-4 py-1 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
-                                确认评分
-                              </button>
+                              <label className="text-sm font-medium">评分 (0-{q?.score_value})：</label>
+                              <input type="number" min={0} max={q?.score_value} value={judgeScoreValue} onChange={(e) => setJudgeScoreValue(parseInt(e.target.value) || 0)} className="w-20 px-3 py-1 border rounded-lg" />
+                              <button onClick={submitJudgeScore} className="px-4 py-1 bg-blue-600 text-white rounded-lg hover:bg-blue-700">确认评分</button>
                             </div>
                           </div>
                         ) : playerAnswers[currentPlayer.id] ? (
                           <div className="p-3 bg-green-50 border border-green-200 rounded-lg mb-2">
-                            <p className="text-green-700">✅ 选手已作答：{playerAnswers[currentPlayer.id]}</p>
-                            {q?.type !== 'short_answer' && (
-                              <p className="text-sm text-green-600 mt-1">系统已自动判分</p>
-                            )}
+                            <p className="text-green-700">✅ {currentPlayer.display_name} 已作答：{playerAnswers[currentPlayer.id]}</p>
+                            {q?.type !== 'short_answer' && <p className="text-sm text-green-600 mt-1">系统已自动判分</p>}
                           </div>
                         ) : (
-                          <p className="text-gray-500 text-sm mb-2">等待选手作答...</p>
+                          <p className="text-gray-500 text-sm mb-2">等待 {currentPlayer.display_name} 作答...</p>
                         )}
 
-                        {/* Manual override buttons */}
                         <div className="flex gap-3">
-                          <button onClick={() => manualConfirm(true)}
-                            className="flex-1 py-3 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 flex items-center justify-center gap-2">
-                            <CheckCircle className="w-5 h-5" /> 强制正确 +{currentRound.config?.scoreCorrect || q?.score_value || 10}
-                          </button>
-                          <button onClick={() => manualConfirm(false)}
-                            className="flex-1 py-3 bg-red-600 text-white rounded-lg font-bold hover:bg-red-700 flex items-center justify-center gap-2">
-                            <XCircle className="w-5 h-5" /> 强制错误 (0分)
-                          </button>
-                          <button onClick={() => manualConfirm(false)}
-                            className="flex-1 py-3 bg-gray-600 text-white rounded-lg font-bold hover:bg-gray-700 flex items-center justify-center gap-2">
-                            <Clock className="w-5 h-5" /> 超时 (0分)
-                          </button>
+                          <button onClick={() => manualConfirm(true)} className="flex-1 py-3 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700 flex items-center justify-center gap-2">
+                            <CheckCircle className="w-5 h-5" /> 强制 {currentPlayer.display_name} 正确 +{currentRound.config?.scoreCorrect || q?.score_value || 10}</button>
+                          <button onClick={() => manualConfirm(false)} className="flex-1 py-3 bg-red-600 text-white rounded-lg font-bold hover:bg-red-700 flex items-center justify-center gap-2">
+                            <XCircle className="w-5 h-5" /> 强制 {currentPlayer.display_name} 错误</button>
+                          <button onClick={() => manualConfirm(false)} className="flex-1 py-3 bg-gray-600 text-white rounded-lg font-bold hover:bg-gray-700 flex items-center justify-center gap-2">
+                            <Clock className="w-5 h-5" /> 超时</button>
                         </div>
                       </div>
                     )}
 
-                    {/* Buzzer */}
                     {currentRound.round_type === 'buzzer' && (
                       <div>
-                        <button onClick={openBuzzer} disabled={buzzerOpen}
-                          className={`w-full py-4 rounded-lg font-bold text-xl transition-all ${
-                            buzzerOpen ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                            : 'bg-amber-500 text-white hover:bg-amber-600 shadow-lg shadow-amber-200 animate-pulse'}`}>
-                          <Zap className="w-6 h-6 inline mr-2" />{buzzerOpen ? '抢答进行中...' : '开始抢答'}
-                        </button>
+                        <button onClick={openBuzzer} disabled={buzzerOpen} className={`w-full py-4 rounded-lg font-bold text-xl transition-all ${buzzerOpen ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-amber-500 text-white hover:bg-amber-600 shadow-lg shadow-amber-200 animate-pulse'}`}>
+                          <Zap className="w-6 h-6 inline mr-2" />{buzzerOpen ? '抢答进行中...' : '开始抢答'}</button>
                         {buzzerResult && (
                           <div className="mt-3 p-4 bg-green-50 border border-green-200 rounded-lg">
                             <p className="text-lg font-bold text-green-700">🎯 {buzzerResult.teamName} · {buzzerResult.playerDisplayId} 抢答成功！</p>
@@ -425,7 +361,6 @@ export default function ControlPage() {
                       </div>
                     )}
 
-                    {/* Simulation */}
                     {currentRound.round_type === 'simulation' && (
                       <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg">
                         <p className="text-amber-800 font-medium">📝 模拟调解环节 — 选手现场作答，评委打分</p>
@@ -433,14 +368,10 @@ export default function ControlPage() {
                       </div>
                     )}
 
-                    {/* Navigation */}
                     <div className="flex gap-3">
-                      <button onClick={() => showQuestion(currentQIndex - 1)} disabled={currentQIndex <= 0}
-                        className="flex-1 py-2 border rounded-lg hover:bg-gray-50 disabled:opacity-30">上一题</button>
-                      <button onClick={nextQuestion} disabled={currentQIndex >= questions.length - 1}
-                        className="flex-1 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-30 flex items-center justify-center gap-2">
-                        <SkipForward className="w-4 h-4" /> 下一题
-                      </button>
+                      <button onClick={() => showQuestion(currentQIndex - 1)} disabled={currentQIndex <= 0} className="flex-1 py-2 border rounded-lg hover:bg-gray-50 disabled:opacity-30">上一题</button>
+                      <button onClick={nextQuestion} disabled={currentQIndex >= questions.length - 1} className="flex-1 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-30 flex items-center justify-center gap-2">
+                        <SkipForward className="w-4 h-4" /> 下一题</button>
                     </div>
                   </div>
                 )}
@@ -461,9 +392,9 @@ export default function ControlPage() {
               </div>
             </div>
 
-            {/* Rankings */}
+            {/* Team Rankings */}
             <div className="bg-white rounded-xl shadow-sm border p-6">
-              <h3 className="font-bold mb-3">🏆 当前排名</h3>
+              <h3 className="font-bold mb-3">🏆 当前排名（团队）</h3>
               <div className="space-y-1 max-h-64 overflow-y-auto text-sm">
                 {teamRankings.map((t: any, i: number) => (
                   <div key={t.teamId} className={`flex items-center justify-between p-2 rounded ${i === 0 ? 'bg-yellow-50' : 'hover:bg-gray-50'}`}>
@@ -475,14 +406,14 @@ export default function ControlPage() {
               </div>
             </div>
 
-            {/* Players */}
+            {/* Player Scores */}
             <div className="bg-white rounded-xl shadow-sm border p-6">
-              <h3 className="font-bold mb-3">👥 选手列表 ({players.length})</h3>
+              <h3 className="font-bold mb-3">👥 选手得分 ({players.length}人)</h3>
               <div className="max-h-48 overflow-y-auto space-y-1 text-sm">
-                {players.map((p: any, i: number) => (
-                  <div key={p.id} className={`flex items-center justify-between p-2 rounded ${currentRound?.round_type === 'required' && i === currentPlayerIndex % players.length ? 'bg-blue-50 border border-blue-200' : 'hover:bg-gray-50'}`}>
-                    <span>{p.display_name}</span>
-                    <span className="text-gray-400">{p.teams?.name}</span>
+                {players.map((p: any) => (
+                  <div key={p.id} className={`flex items-center justify-between p-2 rounded ${currentRound?.round_type === 'required' && p.id === currentPlayer?.id ? 'bg-blue-50 border border-blue-200' : 'hover:bg-gray-50'}`}>
+                    <span>{p.display_name} <span className="text-gray-400">{p.teams?.name}</span></span>
+                    <span className="font-bold text-base">{playerTotals[p.id] || 0}</span>
                   </div>
                 ))}
               </div>
@@ -492,15 +423,9 @@ export default function ControlPage() {
             <div className="bg-white rounded-xl shadow-sm border p-6">
               <h3 className="font-bold mb-3">⚡ 快捷操作</h3>
               <div className="space-y-2">
-                <button onClick={() => send('competition.start', { competitionId: competition.id })}
-                  className="w-full py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 flex items-center justify-center gap-2">
-                  <Play className="w-4 h-4" /> 开始比赛</button>
-                <button onClick={() => send('competition.pause', {})}
-                  className="w-full py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 flex items-center justify-center gap-2">
-                  <Square className="w-4 h-4" /> 暂停比赛</button>
-                <button onClick={() => { if (confirm('确认结束比赛？')) send('competition.finish', { competitionId: competition.id }) }}
-                  className="w-full py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 flex items-center justify-center gap-2">
-                  <Square className="w-4 h-4" /> 结束比赛</button>
+                <button onClick={() => send('competition.start', { competitionId: competition.id })} className="w-full py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 flex items-center justify-center gap-2"><Play className="w-4 h-4" /> 开始比赛</button>
+                <button onClick={() => send('competition.pause', {})} className="w-full py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 flex items-center justify-center gap-2"><Square className="w-4 h-4" /> 暂停比赛</button>
+                <button onClick={() => { if (confirm('确认结束比赛？')) send('competition.finish', { competitionId: competition.id }) }} className="w-full py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 flex items-center justify-center gap-2"><Square className="w-4 h-4" /> 结束比赛</button>
               </div>
             </div>
           </div>
