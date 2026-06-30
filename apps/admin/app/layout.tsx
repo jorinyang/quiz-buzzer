@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import { AdminLayout } from '../components/AdminLayout'
 
 export const metadata: Metadata = {
   title: '后台管理 - 婚调大比武',
@@ -14,7 +15,7 @@ export default function RootLayout({
   return (
     <html lang="zh-CN">
       <body className="bg-gray-50 text-gray-900 min-h-screen">
-        {children}
+        <AdminLayout>{children}</AdminLayout>
       </body>
     </html>
   )
