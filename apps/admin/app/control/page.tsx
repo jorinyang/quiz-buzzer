@@ -16,9 +16,9 @@ function getTimeLimit(round: any, question: any): number {
   return limits[question.type as QuestionType] || 10
 }
 
-function autoGrade(question: any, answer: string, type: QuestionType): boolean {
-  // choice/tf/fill_blank can be auto-graded; short_answer always needs judge
-  if (type === 'short_answer') return false
+function autoGrade(question: any, answer: string, qType: QuestionType): boolean {
+  // Only short_answer always goes to judge
+  if (qType === 'short_answer') return false
   const correct = question.answer?.toString().trim().toUpperCase()
   const given = answer?.toString().trim().toUpperCase()
   return correct === given
