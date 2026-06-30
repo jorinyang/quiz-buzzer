@@ -86,7 +86,9 @@ export default function ControlPage() {
             setTimerStatus(msg.payload.status as string)
             break
           case 'state.buzzer.result':
-            if (msg.payload?.status === 'first') { setBuzzerResult(msg.payload); setBuzzerOpen(false) }
+            if (msg.payload?.status === 'first') {
+              onBuzzerResult(msg.payload)
+            }
             break
           case 'state.player_answer':
             // Receive player answer, auto-grade if possible
@@ -200,9 +202,27 @@ export default function ControlPage() {
     if (!q) return
     setBuzzerOpen(true); setBuzzerResult(null); setPlayerAnswers({})
     const limit = getTimeLimit(currentRound, q)
-    // Send buzzer open WITHOUT question content
+    // Send buzzer open WITHOUT question content — players only see "抢答" button
+    // Question content is sent to ALL after a player wins the buzzer
     send('buzzer.open', { competitionId: competition?.id, questionId: q.id, durationSec: limit })
   }, [questions, currentQIndex, competition, currentRound])
+
+  // When a player wins the buzzer, send question to ALL players so winner can answer
+  const onBuzzerResult = useCallback((result: any) => {
+    setBuzzerResult(result)
+    setBuzzerOpen(false)
+
+    const q = questions[currentQIndex]
+    if (!q) return
+
+    // Send question to ALL players so the winner (and others) see the question + options
+    send('question.show', {
+      competitionId: competition?.id, questionId: q.id, content: q.content, type: q.type,
+      options: q.options, scoreValue: q.score_value,
+      playerId: result.playerId, playerDisplayId: result.playerDisplayId,
+      roundType: 'buzzer',
+    })
+  }, [questions, currentQIndex, competition])
 
   // Manual confirm for operator (buzzer rounds, or operator override)
   const manualConfirm = useCallback(async (correct: boolean) => {
