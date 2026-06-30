@@ -176,6 +176,7 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
 
     case 'score.confirm':
       stopTimer()
+      console.log('[WS] score.confirm received:', JSON.stringify({ playerId: payload.playerId, teamId: payload.teamId, scoreChange: payload.scoreChange, correct: payload.correct }))
       // Broadcast score to ALL clients — player clients filter by playerId
       broadcast('state.score', {
         playerId: payload.playerId,
@@ -186,6 +187,7 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
         playerName: payload.playerName,
         teamName: payload.teamName,
       })
+      console.log('[WS] state.score broadcasted to', clients.size, 'clients')
       if (payload.rankings) {
         broadcast('state.ranking', { rankings: payload.rankings })
       }
@@ -214,6 +216,7 @@ function handleMessage(ws: WebSocket, client: Client, msg: WsMessage) {
 
     case 'player.submit_answer':
       // Player submitted answer for required rounds (choice/tf/fill/short)
+      console.log('[WS] player.submit_answer received:', JSON.stringify({ playerId: payload.playerId, teamId: payload.teamId, answer: payload.answer, questionId: payload.questionId }))
       broadcast('state.player_answer', {
         playerId: payload.playerId,
         teamId: payload.teamId,

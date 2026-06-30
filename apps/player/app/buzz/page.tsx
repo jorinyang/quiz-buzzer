@@ -16,8 +16,8 @@ export default function BuzzPage() {
   // Question state
   const [currentQuestion, setCurrentQuestion] = useState<any>(null)
   const [roundType, setRoundType] = useState<string | null>(null)
-  const [answerSubmitted, setAnswerSubmitted] = useState(false)
-  const [selectedAnswer, setSelectedAnswer] = useState('')
+  const [answerConfirmed, setAnswerConfirmed] = useState(false)
+  const [pendingAnswer, setPendingAnswer] = useState('')
   const [fillAnswer, setFillAnswer] = useState('')
   // Buzzer question: won the buzz, now answer
   const [isBuzzerWinner, setIsBuzzerWinner] = useState(false)
@@ -64,13 +64,12 @@ export default function BuzzPage() {
           case 'state.question':
             if (msg.payload.action !== 'next') {
               setCurrentQuestion(msg.payload); setRoundType(msg.payload.roundType || null)
-              setAnswerSubmitted(false); setSelectedAnswer(''); setFillAnswer('')
+              setAnswerConfirmed(false); setPendingAnswer(''); setFillAnswer('')
               if (msg.payload.roundType === 'buzzer') {
-                // Question shown AFTER buzz win — player is answering
                 if (isBuzzerWinner) setBuzzerState('buzzed_answering')
               }
             } else {
-              setCurrentQuestion(null); setAnswerSubmitted(false); setSelectedAnswer(''); setFillAnswer('')
+              setCurrentQuestion(null); setAnswerConfirmed(false); setPendingAnswer(''); setFillAnswer('')
               setIsBuzzerWinner(false)
             }
             break
@@ -91,8 +90,8 @@ export default function BuzzPage() {
             break
           case 'state.score':
             {
-              const pid = msg.payload.playerId
-              if (info && pid === info.id) {
+              const pid = msg.payload.playerId as string
+              if (info && pid && pid === info.id) {
                 if (msg.payload.correct !== undefined) setLastResult(msg.payload.correct ? '✅ 回答正确' : '❌ 回答错误')
                 if (msg.payload.scoreChange) setPlayerScore((prev: number) => prev + (msg.payload.scoreChange as number))
               }
@@ -120,18 +119,33 @@ export default function BuzzPage() {
     }
   }, [])
 
-  const submitAnswer = useCallback((answer: string) => {
-    if (answerSubmitted) return
-    setAnswerSubmitted(true); setSelectedAnswer(answer); setFillAnswer(answer)
+  // Step 1: Player selects an answer (not yet confirmed)
+  const selectAnswer = useCallback((answer: string) => {
+    if (answerConfirmed) return
+    setPendingAnswer(answer)
+    setFillAnswer(answer)
+  }, [answerConfirmed])
+
+  // Step 2: Player clicks CONFIRM to submit
+  const confirmAnswer = useCallback(() => {
+    if (answerConfirmed || !pendingAnswer.trim()) return
+    setAnswerConfirmed(true)
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       const info = playerRef.current
       wsRef.current.send(JSON.stringify({
         type: 'player.submit_answer',
-        payload: { competitionId: 'current', questionId: currentQuestion?.questionId || 'current', playerId: info?.id, teamId: info?.teamId, teamName: info?.teamName || '', playerName: info?.displayName || '', answer },
+        payload: { competitionId: 'current', questionId: currentQuestion?.questionId || 'current', playerId: info?.id, teamId: info?.teamId, teamName: info?.teamName || '', playerName: info?.displayName || '', answer: pendingAnswer },
         timestamp: Date.now()
       }))
     }
-  }, [answerSubmitted, currentQuestion])
+  }, [answerConfirmed, pendingAnswer, currentQuestion])
+
+  // Step 3: Player can cancel selection before confirming
+  const cancelSelection = useCallback(() => {
+    if (answerConfirmed) return
+    setPendingAnswer('')
+    setFillAnswer('')
+  }, [answerConfirmed])
 
   if (!playerInfo) {
     return (
@@ -164,40 +178,77 @@ export default function BuzzPage() {
             </span>
             <p className="text-lg font-bold mb-6">{currentQuestion.content}</p>
 
+            {/* Choice options */}
             {(currentQuestion.type === 'choice') && currentQuestion.options && (
               <div className="grid grid-cols-2 gap-3">
-                {(currentQuestion.options as string[]).map((opt: string, i: number) => (
-                  <button key={i} onClick={() => submitAnswer(opt.charAt(0))} disabled={answerSubmitted}
-                    className={`p-4 rounded-xl border-2 text-lg font-bold transition-all ${
-                      answerSubmitted ? selectedAnswer === opt.charAt(0) ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-400'
-                      : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50 active:scale-95'}`}>{opt}</button>
-                ))}
+                {(currentQuestion.options as string[]).map((opt: string, i: number) => {
+                  const letter = opt.charAt(0)
+                  const isSelected = pendingAnswer === letter
+                  return (
+                    <button key={i} onClick={() => selectAnswer(letter)} disabled={answerConfirmed}
+                      className={`p-4 rounded-xl border-2 text-lg font-bold transition-all ${
+                        answerConfirmed
+                          ? isSelected ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-400'
+                          : isSelected ? 'border-blue-500 bg-blue-100 text-blue-700 ring-2 ring-blue-300' : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50 active:scale-95'
+                      }`}>{opt}</button>
+                  )
+                })}
               </div>
             )}
 
+            {/* True/False options */}
             {currentQuestion.type === 'true_false' && (
               <div className="grid grid-cols-2 gap-3">
-                {[{val:'T',label:'✅ 正确'},{val:'F',label:'❌ 错误'}].map(({val,label}) => (
-                  <button key={val} onClick={() => submitAnswer(val)} disabled={answerSubmitted}
-                    className={`p-4 rounded-xl border-2 text-lg font-bold transition-all ${
-                      answerSubmitted ? selectedAnswer === val ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-400'
-                      : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50 active:scale-95'}`}>{label}</button>
-                ))}
+                {[{val:'T',label:'✅ 正确'},{val:'F',label:'❌ 错误'}].map(({val,label}) => {
+                  const isSelected = pendingAnswer === val
+                  return (
+                    <button key={val} onClick={() => selectAnswer(val)} disabled={answerConfirmed}
+                      className={`p-4 rounded-xl border-2 text-lg font-bold transition-all ${
+                        answerConfirmed
+                          ? isSelected ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 text-gray-400'
+                          : isSelected ? 'border-blue-500 bg-blue-100 text-blue-700 ring-2 ring-blue-300' : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50 active:scale-95'
+                      }`}>{label}</button>
+                  )
+                })}
               </div>
             )}
 
+            {/* Fill blank / Short answer */}
             {(currentQuestion.type === 'fill_blank' || currentQuestion.type === 'short_answer') && (
               <div>
-                <input type="text" value={fillAnswer} onChange={(e) => setFillAnswer(e.target.value)} disabled={answerSubmitted}
+                <input type="text" value={fillAnswer}
+                  onChange={(e) => { setFillAnswer(e.target.value); setPendingAnswer(e.target.value) }}
+                  disabled={answerConfirmed}
                   placeholder={currentQuestion.type === 'fill_blank' ? '输入答案...' : '输入简答内容...'}
                   className="w-full px-4 py-3 border rounded-lg text-lg disabled:bg-gray-100" />
-                <button onClick={() => submitAnswer(fillAnswer)} disabled={answerSubmitted || !fillAnswer.trim()}
-                  className="mt-3 w-full py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 disabled:opacity-50">
-                  {answerSubmitted ? '✅ 已提交' : '提交答案'}</button>
               </div>
             )}
 
-            {answerSubmitted && <p className="mt-3 text-green-600 font-medium">✅ 答案已提交，等待判定</p>}
+            {/* Action buttons */}
+            {!answerConfirmed ? (
+              <div className="mt-4 space-y-2">
+                {pendingAnswer && (
+                  <button onClick={confirmAnswer}
+                    className="w-full py-3 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700">
+                    ✅ 确定提交
+                  </button>
+                )}
+                {pendingAnswer && (
+                  <button onClick={cancelSelection}
+                    className="w-full py-2 text-gray-500 hover:text-gray-700 text-sm">
+                    取消选择
+                  </button>
+                )}
+                {!pendingAnswer && (
+                  <p className="text-sm text-gray-400 mt-2">请先选择一个答案，然后点击确定提交</p>
+                )}
+              </div>
+            ) : (
+              <div className="mt-3 space-y-1">
+                <p className="text-green-600 font-medium">✅ 答案已提交，等待判定</p>
+                <p className="text-sm text-gray-500">你的答案：{pendingAnswer}</p>
+              </div>
+            )}
           </div>
         </div>
       )}

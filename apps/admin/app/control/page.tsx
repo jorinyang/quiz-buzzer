@@ -96,8 +96,11 @@ export default function ControlPage() {
   }
 
   function send(type: string, payload: any = {}) {
+    console.log('[admin] send:', type, 'ws state:', wsRef.current?.readyState, 'payload:', JSON.stringify(payload).substring(0, 200))
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type, payload, timestamp: Date.now() }))
+    } else {
+      console.log('[admin] WS NOT OPEN, cannot send', type)
     }
   }
 
